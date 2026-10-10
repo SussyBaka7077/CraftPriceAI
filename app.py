@@ -116,6 +116,6 @@ with st.expander("Local SHAP explanation (selected recommendation)"):
     except Exception as exc:
         st.warning(f"SHAP explanation could not be rendered: {exc}")
 
-st.caption("Synthetic-data demonstration only. Historical association is not causal proof; new products and changing markets carry additional uncertainty. what is this? what am i looking at?"): 
+st.caption("Synthetic-data demonstration only. Historical association is not causal proof; new products and changing markets carry additional uncertainty.") 
 
 
