@@ -1,5 +1,7 @@
+import pytest
 import pandas as pd
-from craftprice.pricing import PricingConstraints, optimize_price
+from craftprice.pricing import (PricingConstraints, optimize_price,
+                                nearest_price_row, diagnose_recommendation)
 
 
 class DemandModel:
@@ -19,6 +21,58 @@ def scenario():
 def test_optimizer_only_returns_feasible_prices():
     table, best = optimize_price(DemandModel(), scenario(), PricingConstraints(min_margin_pct=.2, price_step=10))
     assert not table.empty
-    assert (table["price"] >= 336).all()
+    assert (table["price"] >= 280 / .8).all()
     assert best["estimated_contribution"] == table["estimated_contribution"].max()
 
+
+def test_margin_floor_is_measured_on_price_for_all_margins():
+    high_market = scenario()
+    high_market["competitor_avg_price"] = 3000
+    for margin in (.2, .5, .9):
+        table, _ = optimize_price(DemandModel(), high_market,
+                                  PricingConstraints(min_margin_pct=margin, price_step=10))
+        assert not table.empty
+        assert ((table["price"] - 280) / table["price"] >= margin - 1e-9).all()
+
+
+def test_min_margin_at_or_above_100_percent_is_rejected():
+    with pytest.raises(ValueError, match="must be below 100%"):
+        optimize_price(DemandModel(), scenario(), PricingConstraints(min_margin_pct=1.0, price_step=10))
+    with pytest.raises(ValueError, match="must be below 100%"):
+        optimize_price(DemandModel(), scenario(), PricingConstraints(min_margin_pct=1.2, price_step=10))
+
+
+def test_nearest_price_row_finds_closest_candidate():
+    table, _ = optimize_price(DemandModel(), scenario(), PricingConstraints(min_margin_pct=.2, price_step=10))
+    row = nearest_price_row(table, current_price=414.0)
+    assert row["price"] == 410
+    assert row["estimated_contribution"] == table.loc[table["price"] == 410, "estimated_contribution"].iloc[0]
+
+
+def test_diagnose_at_band_edge_reports_the_constraint_as_source():
+    s = scenario()
+    s["unit_cost"] = 200
+    s["competitor_avg_price"] = 300
+    constraints = PricingConstraints(min_margin_pct=.2, competitor_band_pct=.15, price_step=10)
+    table, best = optimize_price(DemandModel(), s, constraints)
+    diag = diagnose_recommendation(table, best, constraints, competitor_price=300)
+    assert diag["lower"] == pytest.approx(max(0, 200 / .8, 300 * .85))
+    assert diag["upper"] == pytest.approx(min(10_000, 300 * 1.15))
+    assert diag["at_upper_bound"] is True
+    assert diag["at_lower_bound"] is False
+    assert diag["binding_upper_source"] == "competitor_band"
+    assert diag["note"] is not None
+    assert "±15%" in diag["note"]
+
+
+def test_diagnose_interior_optimum_has_no_note():
+    s = scenario()
+    s["unit_cost"] = 200
+    s["competitor_avg_price"] = 300
+    constraints = PricingConstraints(min_margin_pct=.2, competitor_band_pct=.6, price_step=10)
+    table, best = optimize_price(DemandModel(), s, constraints)
+    diag = diagnose_recommendation(table, best, constraints, competitor_price=300)
+    assert diag["at_upper_bound"] is False
+    assert diag["at_lower_bound"] is False
+    assert diag["binding_upper_source"] == "competitor_band"
+    assert diag["note"] is None

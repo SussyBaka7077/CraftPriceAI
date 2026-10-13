@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(python3 -I audit_data.py)",
+      "Bash(python3 -c \"import numpy; print\\(numpy.__file__\\)\")",
+      "Bash(python3 -s -c \"import numpy; print\\('s ok', numpy.__file__\\)\")",
+      "Bash(python3 -m site)",
+      "Bash(python3 audit_data.py)"
     ]
   }
 }

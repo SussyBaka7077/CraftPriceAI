@@ -24,6 +24,28 @@ class PricingConstraints:
     price_step: float = 10
 
 
+def _feasible_bounds(unit_cost: float, competitor_price: float,
+                     constraints: PricingConstraints) -> tuple[float, float]:
+    """Return the feasible price band ``[lower, upper]``.
+
+    ``min_margin_pct`` is a margin *on price* -- the figure the app's "Minimum
+    margin" slider shows, ``(price - unit_cost) / price``. The floor is therefore
+    ``unit_cost / (1 - min_margin_pct)``, NOT the markup ``unit_cost * (1 + ...)``:
+    the markup version would let the displayed margin-on-price fall below the
+    slider value. A margin of 100% or more needs an infinite price, so reject it
+    before the division.
+    """
+    if constraints.min_margin_pct >= 1:
+        raise ValueError("Minimum margin must be below 100% (of price).")
+    lower = max(
+        constraints.min_price,
+        unit_cost / (1 - constraints.min_margin_pct),
+        competitor_price * (1 - constraints.competitor_band_pct),
+    )
+    upper = min(constraints.max_price, competitor_price * (1 + constraints.competitor_band_pct))
+    return lower, upper
+
+
 def optimize_price(model, scenario: dict, constraints: PricingConstraints) -> tuple[pd.DataFrame, pd.Series]:
     """Simulate valid discrete prices and maximise estimated contribution, not demand.
 
@@ -39,9 +61,7 @@ def optimize_price(model, scenario: dict, constraints: PricingConstraints) -> tu
 
     unit_cost = float(scenario["unit_cost"])
     competitor_price = float(scenario["competitor_avg_price"])
-    lower = max(constraints.min_price, unit_cost * (1 + constraints.min_margin_pct),
-                competitor_price * (1 - constraints.competitor_band_pct))
-    upper = min(constraints.max_price, competitor_price * (1 + constraints.competitor_band_pct))
+    lower, upper = _feasible_bounds(unit_cost, competitor_price, constraints)
 
     # `lower`/`upper` are products of floats, so a bound that is mathematically an exact
     # step multiple can be stored a few ulps off (e.g. 350 * 1.4 == 489.99999999999994,
@@ -52,12 +72,13 @@ def optimize_price(model, scenario: dict, constraints: PricingConstraints) -> tu
     #
     # Every comparison below uses this same tolerance. The feasibility guard must NOT be a
     # bare `lower > upper`: the two bounds can coincide mathematically and still straddle
-    # each other in float. For `unit_cost=100, min_margin=0.70, competitor=125,
-    # band=0.36, step=10` both bounds describe the single price 170 (125 * 1.36 is exactly
-    # 170 in decimal), yet `upper` stores as 169.99999999999997 -- one ulp below `lower`.
-    # A bare guard would reject a price the seller genuinely has. Guarding with the same
-    # tolerance lets the grid below decide instead; a genuinely infeasible pair still fails
-    # there with the more specific "no price in steps of N fits" message.
+    # each other in float. For `unit_cost=34, min_margin=0.80, competitor=125, band=0.36,
+    # step=10` the margin floor 34/0.2 and the band cap 125*1.36 are both mathematically
+    # 170, yet float stores the floor as 170.00000000000003 and the cap as
+    # 169.99999999999997 -- one ulp above and below the price the seller genuinely has.
+    # A bare guard would reject that price. Guarding with the same tolerance lets the grid
+    # below decide instead; a genuinely infeasible pair still fails there with the more
+    # specific "no price in steps of N fits" message.
     tolerance = 1e-9  # in units of `step`
     if lower > upper + step * tolerance:
         raise ValueError("Constraints leave no feasible price. Widen the range or lower the minimum margin.")
@@ -82,12 +103,87 @@ def optimize_price(model, scenario: dict, constraints: PricingConstraints) -> tu
     candidates["price"] = prices
     candidates = add_price_features(candidates)
     candidates["predicted_demand"] = np.clip(model.predict(candidates[FEATURES]), 0, None)
-    print(f"Predicted demand range: {candidates['predicted_demand'].min():.0f} - {candidates['predicted_demand'].max():.0f}")
     candidates["estimated_revenue"] = candidates["price"] * candidates["predicted_demand"]
     candidates["estimated_contribution"] = (candidates["price"] - unit_cost) * candidates["predicted_demand"]
     candidates["margin_pct"] = (candidates["price"] - unit_cost) / candidates["price"]
     recommendation = candidates.loc[candidates["estimated_contribution"].idxmax()]
     return candidates, recommendation
+
+
+def nearest_price_row(candidates: pd.DataFrame, current_price: float) -> pd.Series:
+    """Return the candidate row whose price is closest to ``current_price``."""
+    nearest_index = (candidates["price"] - current_price).abs().argsort().iloc[0]
+    return candidates.iloc[nearest_index]
+
+
+def diagnose_recommendation(candidates: pd.DataFrame, recommendation: pd.Series,
+                            constraints: PricingConstraints,
+                            competitor_price: float) -> dict:
+    """Say whether a constraint edge, not the demand model, picked the price.
+
+    Returns a dict with the feasible bounds, flags for a recommendation sitting at
+    (or within one ``price_step`` of) either end of the band, the source of the
+    upper bound, and a plain-language ``note`` when an edge is binding.
+    """
+    unit_cost = float(recommendation["unit_cost"])
+    lower, upper = _feasible_bounds(unit_cost, competitor_price, constraints)
+
+    band_lower = competitor_price * (1 - constraints.competitor_band_pct)
+    band_upper = competitor_price * (1 + constraints.competitor_band_pct)
+    margin_floor = unit_cost / (1 - constraints.min_margin_pct)
+
+    step = float(constraints.price_step)
+    tolerance = 1e-9  # in units of `step`, same spirit as optimize_price
+    within_step = step * (1 + tolerance)
+
+    price = float(recommendation["price"])
+    max_candidate = float(candidates["price"].max())
+    min_candidate = float(candidates["price"].min())
+    at_upper_bound = bool(price >= max_candidate - step * tolerance and upper - price <= within_step)
+    at_lower_bound = bool(price <= min_candidate + step * tolerance and price - lower <= within_step)
+
+    # Which constraint actually produced each bound? Dict iteration order mirrors the
+    # max()/min() argument order in _feasible_bounds, so near-ties resolve identically.
+    upper_sources = {"max_price": float(constraints.max_price), "competitor_band": band_upper}
+    binding_upper_source = min(upper_sources, key=lambda source: upper_sources[source])
+    lower_sources = {"min_price": float(constraints.min_price),
+                     "margin": margin_floor, "competitor_band": band_lower}
+    binding_lower_source = max(lower_sources, key=lambda source: lower_sources[source])
+
+    band = constraints.competitor_band_pct
+    margin = constraints.min_margin_pct
+    note: str | None = None
+    if at_upper_bound:
+        if binding_upper_source == "max_price":
+            note = (f"This is the highest price allowed by your cap of ₹{float(constraints.max_price):,.0f}. "
+                    "The cap set this price, not the model — raise the cap to see whether "
+                    "a higher price would earn more.")
+        else:
+            note = (f"This is the highest price inside your ±{band:.0%} competitor band. "
+                    "The band set this price, not the model — widen the band to see whether "
+                    "a higher price would earn more.")
+    elif at_lower_bound:
+        if binding_lower_source == "margin":
+            note = (f"This is the lowest price that keeps your minimum margin of {margin:.0%} on price. "
+                    "The margin floor set this price, not the model — lower the minimum margin to see "
+                    "whether a lower price would earn more.")
+        elif binding_lower_source == "min_price":
+            note = (f"This is the lowest price allowed by your minimum price of "
+                    f"₹{float(constraints.min_price):,.0f}. The floor set this price, not the model — "
+                    "lower the minimum price to see whether a lower price would earn more.")
+        else:
+            note = (f"This is the lowest price inside your ±{band:.0%} competitor band. "
+                    "The band set this price, not the model — widen the band to see whether "
+                    "a lower price would earn more.")
+
+    return {
+        "lower": float(lower),
+        "upper": float(upper),
+        "at_upper_bound": at_upper_bound,
+        "at_lower_bound": at_lower_bound,
+        "binding_upper_source": binding_upper_source,
+        "note": note,
+    }
 
 
 def main() -> None:

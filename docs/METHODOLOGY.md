@@ -10,7 +10,7 @@ For each discrete feasible price, the application rebuilds price-derived feature
 
 `estimated contribution = (price - unit cost) × predicted demand`
 
-The recommended price is the candidate with the highest estimated contribution. Feasibility requires the seller's minimum margin and a selected band around competitor price. The recommendation is conditional on those business assumptions.
+The recommended price is the candidate with the highest estimated contribution. Feasibility requires the candidate price to be at least `unit_cost / (1 − minimum margin)` — so the margin-on-price shown to the seller, `(price − unit_cost) / price`, never falls below the chosen minimum — and to sit within the selected band around competitor price. The recommendation is conditional on those business assumptions.
 
 ## Synthetic dataset assumptions
 
