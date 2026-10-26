@@ -22,6 +22,8 @@ class PricingConstraints:
     max_price: float = 10_000
     competitor_band_pct: float = .40
     price_step: float = 10
+    extrapolation_threshold: float = .15
+    extrapolation_decay: float = 6.0
 
 
 def _feasible_bounds(unit_cost: float, competitor_price: float,
@@ -102,7 +104,25 @@ def optimize_price(model, scenario: dict, constraints: PricingConstraints) -> tu
     candidates = pd.DataFrame([scenario] * len(prices))
     candidates["price"] = prices
     candidates = add_price_features(candidates)
-    candidates["predicted_demand"] = np.clip(model.predict(candidates[FEATURES]), 0, None)
+
+    raw_demand = np.clip(model.predict(candidates[FEATURES]), 0, None)
+    # Tree ensembles are step functions that cannot extrapolate past the highest price
+    # splits seen in training (~+20-28% above competitor price) and can wiggle upward.
+    # Enforce non-increasing demand across rising prices (isotonic cumulative minimum)
+    # and apply an out-of-distribution choke decay above `extrapolation_threshold`.
+    monotone_demand = np.minimum.accumulate(raw_demand)
+    if competitor_price > 0 and constraints.extrapolation_decay > 0:
+        excess_gap = np.clip(
+            prices / competitor_price - (1.0 + constraints.extrapolation_threshold),
+            0.0,
+            None,
+        )
+        choke_factor = np.exp(-constraints.extrapolation_decay * (excess_gap ** 2))
+    else:
+        choke_factor = np.ones_like(prices)
+
+    candidates["raw_predicted_demand"] = raw_demand
+    candidates["predicted_demand"] = monotone_demand * choke_factor
     candidates["estimated_revenue"] = candidates["price"] * candidates["predicted_demand"]
     candidates["estimated_contribution"] = (candidates["price"] - unit_cost) * candidates["predicted_demand"]
     candidates["margin_pct"] = (candidates["price"] - unit_cost) / candidates["price"]
@@ -125,7 +145,7 @@ def diagnose_recommendation(candidates: pd.DataFrame, recommendation: pd.Series,
     (or within one ``price_step`` of) either end of the band, the source of the
     upper bound, and a plain-language ``note`` when an edge is binding.
     """
-    unit_cost = float(recommendation["unit_cost"])
+    unit_cost = float(recommendation["unit_cost"])  # type: ignore[arg-type]
     lower, upper = _feasible_bounds(unit_cost, competitor_price, constraints)
 
     band_lower = competitor_price * (1 - constraints.competitor_band_pct)
@@ -136,9 +156,9 @@ def diagnose_recommendation(candidates: pd.DataFrame, recommendation: pd.Series,
     tolerance = 1e-9  # in units of `step`, same spirit as optimize_price
     within_step = step * (1 + tolerance)
 
-    price = float(recommendation["price"])
-    max_candidate = float(candidates["price"].max())
-    min_candidate = float(candidates["price"].min())
+    price = float(recommendation["price"])  # type: ignore[arg-type]
+    max_candidate = float(candidates["price"].max())  # type: ignore[arg-type]
+    min_candidate = float(candidates["price"].min())  # type: ignore[arg-type]
     at_upper_bound = bool(price >= max_candidate - step * tolerance and upper - price <= within_step)
     at_lower_bound = bool(price <= min_candidate + step * tolerance and price - lower <= within_step)
 

@@ -76,3 +76,18 @@ def test_diagnose_interior_optimum_has_no_note():
     assert diag["at_lower_bound"] is False
     assert diag["binding_upper_source"] == "competitor_band"
     assert diag["note"] is None
+
+
+def test_optimizer_enforces_monotonic_demand_and_extrapolation_decay():
+    class FlatTailTreeModel:
+        def predict(self, frame):
+            # Simulates a tree model that wiggles upward and flatlines at high prices
+            return pd.Series(20.0, index=frame.index).where(frame["price"] < 460, 20.5)
+
+    s = scenario()
+    s["unit_cost"] = 320
+    s["competitor_avg_price"] = 350
+    constraints = PricingConstraints(min_margin_pct=.2, competitor_band_pct=.4, price_step=10)
+    table, best = optimize_price(FlatTailTreeModel(), s, constraints)
+    assert table["predicted_demand"].is_monotonic_decreasing
+    assert best["price"] < table["price"].max()

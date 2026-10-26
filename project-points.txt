@@ -1,0 +1,288 @@
+================================================================
+CRAFTPRICE AI — THE TEA STALL STORY (presentation script)
+================================================================
+
+THE SETUP
+---------
+Suppose I am opening a tea stall and I have to decide the price of
+one cup. It costs me $12 to make one cup, and the stall across the
+street sells it for $20. The question: at what price should I sell
+my cup for MAXIMUM PROFIT?
+
+CraftPriceAI answers this in three stages:
+  STAGE 1 — LEARN   : build a "crystal ball" that predicts sales
+  STAGE 2 — DECIDE  : try every sensible price, keep the best one
+  STAGE 3 — SHOW    : present it to the seller on a dashboard
+
+Note: the tea numbers below are a small toy example (5 weeks of
+data) so every calculation fits on paper. The real project does
+exactly the same logic with 12,600 rows and 23 inputs. Where the
+real numbers differ, I say so.
+
+================================================================
+STAGE 1 — LEARN (build the crystal ball)
+================================================================
+
+STEP 1 — Write down the past
+-----------------------------
+
+Learned parameters — 40,662 total
+5 weeks of my own sales history (the data):
+
+  Week | Price charged | Glasses sold
+    1   |     $15       |    100
+    2   |     $18       |     82
+    3   |     $21       |     58
+    4   |     $24       |     34
+    5   |     $27       |     16
+
+  - Price  = the clue we know in advance  (technical name: FEATURE)
+  - Glasses = the answer we want to predict (technical name: TARGET)
+  - Predicting a NUMBER (not yes/no) is called REGRESSION.
+
+STEP 2 — The train/test split (the exam it never studied)
+----------------------------------------------------------
+  - Weeks 1-5  -> used for TRAINING (the model learns from these)
+  - Week 6     -> kept hidden as the TEST set (touched once, at the
+                  very end, to grade the model fairly)
+
+  Why split by TIME and not randomly? Because you cannot use next
+  week's sales to learn this week's. Two of our inputs
+  (previous_week_sales, rolling_4_week_sales) come from earlier
+  weeks, so a random split would let the model peek at answers.
+  The real project splits chronologically 70/15/15
+  (modeling.py: chronological_split).
+
+STEP 3 — The simple model: a straight line (regression)
+-------------------------------------------------------
+  Shape of the guess:   glasses = m * price + b
+
+  We do NOT calculate m and b in our code. The imported regression
+  library does all of it inside .fit(). Training just means
+  "finding m and b" — the library finds them from the data.
+
+  (Hand version, just to show what .fit() is doing internally:
+   average price = 21, average glasses = 58
+   m = -648/90 = -7.2   b = 209.2
+   so: glasses = 209.2 - 7.2 * price
+   read as: "every $1 on the price scares off about 7 people")
+
+  IMPORTANT CLARIFICATION: this line is our BASELINE / contrgol
+  model ("can a simple rule do it?"). The model we actually ship
+  is XGBoost (Step 5). Real scores on the hidden test period:
+     line      -> MAE 4.26
+     XGBoost   -> MAE 4.14   (the shipped one)
+
+STEP 4 — Grading the model: the three scores (metrics)
+-------------------------------------------------------
+  MAE  (Mean Absolute Error):
+     "on a typical day I am off by about 1.4 glasses" (toy)
+     real project: off by about 4.1 UNITS.
+
+  RMSE (Root Mean Squared Error):
+     same idea, but it punishes big blunders much more.
+
+  R^2 (coefficient of determination):
+     "price alone explains 99.7% of the up-and-down in my sales"
+     (toy — my invented data is unrealistically clean)
+     real project: R^2 = 0.468.
+
+  THE HONEST LINE TO SAY (most students miss this):
+     "0.468 sounds low, but the data has random noise baked into
+      every sale (weather, moods...). A PERFECT model could only
+      reach 0.566 on this dataset. So we capture 83% of everything
+      knowable, and our MAE is within 6.6% of a perfect model.
+      Adding more model complexity here would buy nothing."
+
+STEP 5 — The real brain: XGBoost (450 tiny flowcharts)
+------------------------------------------------------
+  Why flowcharts (decision trees) and not just the line?
+  NOT merely because "season matters" — a line could learn that by
+  ADDING an effect ("June heat: -5 glasses"). The real reason is
+  COMBINATIONS (technical term: interactions). A line can only add
+  effects ("price -3, season -5"), it cannot say:
+
+     "a $1 price rise hurts TWICE as much in June heat
+      as it does in December"
+
+  Every question inside a flowchart depends on the answers above
+  it. That is what a line can never do. Our data generator builds
+  demand by MULTIPLYING effects, and multiplication creates exactly
+  these combinations.
+
+  How they are built (gradient boosting — a relay race):
+     - Round 0: start dumb — always guess the average (58)
+     - Flowchart 1: "is price above $21?" ->
+         No  weeks: average miss +22 -> nudge up
+         Yes weeks: average miss -33 -> nudge down
+     - Each nudge applied at only 4.5% strength (learning_rate)
+     - Repeat 450 times (n_estimators = 450)
+     - Each flowchart asks at most 5 questions (max_depth = 5)
+     - Small steps, many rounds: we never overshoot badly.
+
+  We do not code the relay race. xgb.fit() (modeling.py) IS the
+  relay race. The finished brain is saved as
+  artifacts/demand_model.joblib.
+
+  One honest detail: in round 1, the $21 week was already perfect,
+  but its teammates' correction dragged it to 69 (temporarily
+  worse). Boosting improves the TEAM total; individual weeks can
+  wobble. The small 4.5% steps are exactly what keeps that safe.
+
+================================================================
+STAGE 2 — DECIDE (turn the ball into a price)
+================================================================
+
+THE GOAL
+--------
+  Money kept = (price - $12 cost) x glasses sold
+  (technical name: CONTRIBUTION)
+
+  Two forces fight as price rises:
+     profit per glass goes UP, glasses sold go DOWN.
+  Their product is a HILL — we want the peak.
+
+  Why not maximize glasses sold? Charge $1 — flood the street,
+  stay poor. Selling more is not the goal; KEEPING more is.
+
+THE RULES (constraints)
+-----------------------
+  1. "I want at least 20% of the FINAL PRICE to be profit"
+     = margin ON PRICE (the correct reading — the one our code uses)
+       price >= 12 / (1 - 0.20) = $15     check: 3/15 = exactly 20%
+
+     THE TRAP (know this — it was a real bug in our project):
+       20% ADDED TO COST (markup) gives 12 x 1.2 = $14.40 —
+       but 2.40/14.40 = only 16.7% margin. You would quietly earn
+       less than you asked for. Nothing crashes; the two numbers
+       just measure different things. That is the most dangerous
+       kind of bug. We fixed it AND wrote a regression test so it
+       can never silently come back (pricing.py: _feasible_bounds).
+
+  2. "Stay within 40% of my competitor's $20" (competitor band):
+       from $12 to $28
+
+  MY PLAYGROUND: $15 to $28.
+  Notice: my own profit rule ($15) binds the bottom — his $12 band
+  floor is weaker. The SELLER's rule is the stricter constraint.
+
+TRY EVERY PRICE (grid search — no calculus)
+---------------------------------------------
+  Each dollar from $15 to $28: ask the ball for glasses, then
+  compute money kept. Brute force, no failure modes.
+
+  Price | Glasses | Profit/glass | Money kept
+   $15  |  101.2  |     $3        |  $303.6
+   $16  |   94.0  |     $4        |  $376.0
+   $17  |   86.8  |     $5        |  $434.0
+   $18  |   79.6  |     $6        |  $477.6
+   $19  |   72.4  |     $7        |  $506.8
+   $20  |   65.2  |     $8        |  $521.6   <- near-tie
+   $21  |   58.0  |     $9        |  $522.0   <- WINNER (peak)
+   $22  |   50.8  |    $10        |  $508.0
+   $23  |   43.6  |    $11        |  $479.6
+   $24  |   36.4  |    $12        |  $436.8
+   $25  |   29.2  |    $13        |  $379.6
+   $26  |   22.0  |    $14        |  $308.0
+   $27  |   14.8  |    $15        |  $222.0
+   $28  |    7.6  |    $16        |  $121.6
+
+  In the code this is ONE function: optimize_price (pricing.py).
+  predicted_demand     = model.predict(...)      (the ball)
+  estimated_revenue    = price x demand          (money IN)
+  estimated_contribution = (price - cost) x demand  (money KEPT)
+  recommendation       = idxmax of contribution  (pick the winner)
+
+THE HONESTY STEPS (the best part of the talk)
+----------------------------------------------
+  a) WHO decided — the model or a rule?
+     $21 sits in the MIDDLE of the $15-28 playground: no rule
+     forced it, the model genuinely picked it.
+     (In the real project, ~60% of recommendations sit on the
+      TOP EDGE of the band — and the app says so out loud:
+      "your band set this price, not the model — widen it to
+      check." That is diagnose_recommendation in pricing.py.
+      Volunteering this is worth a lot.)
+
+  b) Needle or plateau? The peak is FLAT:
+     $19 -> 506.8, $20 -> 521.6, $21 -> 522, $22 -> 508.
+     The true hilltop is $20.50, and whole dollars cannot land on
+     it — so $20 and $21 are a TIE (40 cents apart). The honest
+     answer is "$20-21", not one fake-precise number. My human
+     instinct — "don't look pricier than the rival across the
+     street" — is a valid tie-breaker. That is why the app shows
+     the whole candidate table, not just one shiny number.
+
+  c) Revenue would have LIED:
+     $15 brings the most money IN (15 x 101 = $1,518)
+     but keeps the LEAST profit ($303). We maximize money KEPT
+     (contribution), not money in (revenue).
+
+  d) The hidden pattern (elasticity — great viva moment):
+     At $21, a 1% price rise (~$0.21) loses 7.2 x 0.21 = ~1.5
+     glasses = 2.6% of sales. A 1% rise costs 2.6% of sales —
+     customers are twitchy. This twitchiness is ELASTICITY (~2.6).
+     Shortcut formula for this kind of stall:
+        best price ~= cost + competitor/elasticity
+                    = 12 + 20/2.6 ~= $19.7
+     — which lands exactly on the $20-21 plateau we found by
+     brute force. Two different roads, same hilltop.
+
+  e) The honest range (prediction interval):
+     We know from the hidden test week the ball is typically off
+     by ~2 glasses. So we never say "58 glasses" — we say
+     "about 58, likely 56-60." The app builds this range by
+     measuring its own past misses, and self-checks the honesty:
+     the 80% range actually covers 79.2% of the time.
+
+================================================================
+STAGE 3 — SHOW (the dashboard)
+================================================================
+  - Big numbers: "Charge $21 - expect ~58 glasses (range 56-60)
+    - keep $522 - cost $12"
+  - Picture 1: the SLIDE (glasses falling as price rises,
+    playground shaded, my price and the recommendation marked)
+  - Picture 2: the HILL (money kept vs price, peak visible at
+    $20-21). Two SEPARATE charts — glasses and dollars are not
+    comparable on one ruler (no dual-axis trickery).
+  - The full candidate table with "$21 <- recommended" flagged.
+  - Honest notes in plain words: "$20 is a near-tie — treat
+    $20-21 as the answer." Plus the model's exam report: "typical
+    miss ~2 glasses, measured on weeks it never studied."
+  - Optional "why?" button (SHAP): splits the credit for the
+    estimate among the inputs. In the toy, price did everything;
+    in the real project there are 23 inputs and the split is
+    genuinely interesting. It is the expensive part of the app,
+    so it is behind a toggle and cached.
+
+================================================================
+THE CLOSING LINE
+================================================================
+  "It is not a sales predictor — it is a DECISION TOOL.
+   The model is the engine; the price recommendation is the
+   product. GPS predicts traffic; the driver picks the route."
+
+================================================================
+TOY vs REAL — quick reference (never mix these up)
+================================================================
+                            TOY (tea stall)   REAL PROJECT
+  rows of data              5 weeks           12,600 product-weeks
+  inputs (features)         1 (price)         23
+  model                     line + demo       450 trees (XGBoost)
+  MAE                       1.44 glasses      4.140 units
+  R^2                       0.997 (clean)     0.468 (ceiling 0.566)
+  profit per cup / unit     $12               unit_cost (sum of costs)
+  competitor                $20               competitor_avg_price
+  playground                $15-28 ($1 steps) $400-490 (Rs.10 steps)
+  winner                    $21 (tie w/ $20)  band edge ~60% of time
+
+  KEY CODE MAP (if asked "where is this in the code?"):
+    chronological_split .... modeling.py  (split by date)
+    make_xgb_pipeline ..... modeling.py   (450 trees, the settings)
+    xgb.fit() ............. modeling.py   (the relay race itself)
+    evaluate .............. modeling.py   (MAE / RMSE / R^2)
+    _residual_scale ....... modeling.py   (the honest range)
+    _feasible_bounds ...... pricing.py    (the playground $15-28)
+    optimize_price ........ pricing.py    (try every price)
+    diagnose_recommendation  pricing.py   ("who decided?")
+    tests/test_pricing.py . 6 tests, all on the optimizer

@@ -443,7 +443,7 @@ else:
 price_delta = float(best["price"]) - float(current_price)
 if interval:
     lower, upper, _ = interval
-    demand_text = f"{int(round(selected_demand))} units (80% interval: {int(lower)}–{int(upper)})"
+    demand_text = f"{int(round(selected_demand))} units"
 else:
     demand_text = f"{selected_demand:.1f} units"
 
@@ -454,7 +454,9 @@ rec_col.metric(
     f"₹{price_delta:+,.0f} vs current",
     delta_color="off",
 )
-demand_col.metric("Estimated weekly demand", demand_text)
+demand_col.metric("Approx. weekly demand", demand_text)
+if interval:
+    demand_col.caption(f"80% interval: {int(lower)}–{int(upper)} units")
 contrib_col.metric("Estimated contribution", fmt_inr(best["estimated_contribution"]))
 cost_col.metric("Unit cost", fmt_inr(unit_cost))
 
@@ -484,8 +486,7 @@ if len(candidates) == 1:
 else:
     is_non_increasing = bool(candidates["predicted_demand"].is_monotonic_decreasing)
     mono_note = (
-        "On this candidate grid, predicted demand does not increase as price rises. "
-        "A tree ensemble is a step function, so the curve is stepped rather than smooth."
+        "Predicted demand is monotonically smoothed (isotonic envelope) with an out-of-distribution choke decay applied above +15% of competitor price, preventing tree extrapolation flatlines."
         if is_non_increasing
         else "The demand curve is slightly wiggly: a tree ensemble is a step function, so demand is not strictly decreasing in price on every candidate grid."
     )
