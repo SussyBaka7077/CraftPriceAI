@@ -12,7 +12,6 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from craftprice.config import FEATURES, METRICS_PATH, MODEL_PATH
-from craftprice.explain import explain_recommendation
 from craftprice.modeling import load_model
 from craftprice.pricing import (
     PricingConstraints,
@@ -306,13 +305,6 @@ def _apply_chart_layout(fig: go.Figure, title: str, ylabel: str) -> None:
     )
 
 
-@st.cache_data
-def cached_explain(row_json: str) -> pd.DataFrame:
-    """Explain a single candidate row; cache key is the row itself."""
-    row = pd.read_json(row_json, orient="records")
-    return explain_recommendation(model, row)
-
-
 # -----------------------------------------------------------------------------
 # Page setup
 # -----------------------------------------------------------------------------
@@ -466,11 +458,6 @@ if discount_pct > 0:
         "versus no discount. The measured effect of discounts is usually small."
     )
 
-st.info(
-    "Recommendation maximizes **estimated contribution** within your constraints. "
-    "It is a model-based scenario estimate, not a guarantee of sales or a causal price effect."
-)
-
 if diag.get("note"):
     st.info(diag["note"])
 
@@ -484,19 +471,11 @@ if len(candidates) == 1:
         "Widen the competitor band or lower the minimum margin to see a grid of options."
     )
 else:
-    is_non_increasing = bool(candidates["predicted_demand"].is_monotonic_decreasing)
-    mono_note = (
-        "Predicted demand is monotonically smoothed (isotonic envelope) with an out-of-distribution choke decay applied above +15% of competitor price, preventing tree extrapolation flatlines."
-        if is_non_increasing
-        else "The demand curve is slightly wiggly: a tree ensemble is a step function, so demand is not strictly decreasing in price on every candidate grid."
-    )
-
     col_a, col_b = st.columns(2)
     with col_a:
         st.plotly_chart(make_demand_chart(candidates, best, current_row, diag), width="stretch")
     with col_b:
         st.plotly_chart(make_contribution_chart(candidates, best, current_row, diag), width="stretch")
-    st.caption(mono_note)
 
 # -----------------------------------------------------------------------------
 # Candidate-price table
@@ -576,13 +555,7 @@ if metrics_mtime < model_mtime:
     attribution += " **The metrics file is older than the model file — these numbers may be stale.**"
 st.caption(attribution)
 
-# Warn if the currently selected season was not evaluated.
 per_season = metrics.get("per_season", {})
-selected_season_eval = per_season.get(season, {})
-if selected_season_eval.get("status") == "not_evaluated":
-    st.warning(
-        f"**{season}** was not represented in the chronological holdout, so the season-level metrics below do not apply to your current selection."
-    )
 
 # Build the honest evaluation table.
 eval_rows = []
@@ -659,77 +632,4 @@ st.dataframe(
     },
     width="stretch",
     hide_index=True,
-)
-
-if residual_scale and "z_80" in residual_scale:
-    z_used = float(residual_scale["z_80"])
-    coverage_80 = residual_scale.get("coverage_80")
-    coverage_text = (
-        f" Measured holdout coverage: {coverage_80:.0%}."
-        if coverage_80 is not None
-        else ""
-    )
-    st.caption(
-        f"Demand interval from holdout residuals (±{z_used:.2f}σ); it reflects historical scatter, not a guarantee.{coverage_text}"
-    )
-
-# -----------------------------------------------------------------------------
-# SHAP explanation (compute only when asked)
-# -----------------------------------------------------------------------------
-show_shap = st.toggle("Explain this demand estimate with SHAP", value=False)
-if show_shap:
-    with st.spinner("Computing explanation…"):
-        try:
-            row_json = candidates.loc[[best.name]].copy().to_json(orient="records")
-            explanation = cached_explain(row_json)
-            st.bar_chart(explanation.set_index("feature"))
-            st.caption(
-                "Positive SHAP values push the estimate up; negative values push it down, relative to the model baseline."
-            )
-        except Exception as exc:
-            st.warning(f"SHAP explanation could not be rendered: {exc}")
-
-# -----------------------------------------------------------------------------
-# Optional: what would change this answer?
-# -----------------------------------------------------------------------------
-with st.expander("What would change this answer?"):
-    st.write(
-        "Re-running the optimiser with a wider or narrower competitor band shows how much the recommendation is driven by the band constraint."
-    )
-    sens_rows = []
-    for probe_band in [max(0.0, band - 0.10), min(1.0, band + 0.10)]:
-        label = f"±{probe_band:.0%} competitor band"
-        try:
-            _, probe_best = optimize_price(
-                model,
-                scenario,
-                PricingConstraints(
-                    min_margin_pct=min_margin,
-                    competitor_band_pct=probe_band,
-                    price_step=price_step,
-                ),
-            )
-            sens_rows.append(
-                {
-                    "Scenario": label,
-                    "Recommended price": fmt_inr(probe_best["price"]),
-                    "Move from your current price": fmt_inr(float(probe_best["price"]) - float(current_price)),
-                }
-            )
-        except ValueError:
-            sens_rows.append(
-                {
-                    "Scenario": label,
-                    "Recommended price": "not feasible",
-                    "Move from your current price": "—",
-                }
-            )
-    st.dataframe(pd.DataFrame(sens_rows), width="stretch", hide_index=True)
-
-# -----------------------------------------------------------------------------
-# Footer disclaimer
-# -----------------------------------------------------------------------------
-st.caption(
-    "Synthetic-data demonstration only. Historical association is not causal proof; "
-    "new products and changing markets carry additional uncertainty."
 )
